@@ -4,23 +4,31 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
+from kirara_ai.events.event_bus import EventBus
+from kirara_ai.ioc.container import DependencyContainer
+from kirara_ai.ioc.inject import Inject
 from kirara_ai.logger import get_logger
 from kirara_ai.workflow.core.block import Block, ConditionBlock, LoopBlock
 from kirara_ai.workflow.core.block.registry import BlockRegistry
+from kirara_ai.workflow.core.execution.exceptions import BlockExecutionFailedException
 from kirara_ai.workflow.core.workflow import Workflow
 
 
 class WorkflowExecutor:
-    def __init__(self, workflow: Workflow, registry: BlockRegistry):
+    
+    @Inject()
+    def __init__(self, container: DependencyContainer, workflow: Workflow, registry: BlockRegistry, event_bus: EventBus):
         """
         初始化 WorkflowExecutor 实例。
 
         :param workflow: 要执行的工作流对象
         :param registry: Block注册表，用于类型检查
         """
+        self.container = container
         self.logger = get_logger("WorkflowExecutor")
         self.workflow = workflow
         self.registry = registry
+        self.event_bus = event_bus
         self.results = defaultdict(dict)
         self.variables = {}  # 存储工作流变量
         self.logger.info(
@@ -65,6 +73,8 @@ class WorkflowExecutor:
 
         :return: 包含每个块执行结果的字典，键为块名，值为块的输出
         """
+        from kirara_ai.events import WorkflowExecutionBegin, WorkflowExecutionEnd
+        self.event_bus.post(WorkflowExecutionBegin(self.workflow, self))
         self.logger.info("Starting workflow execution")
         loop = asyncio.get_event_loop()
         with ThreadPoolExecutor() as executor:
@@ -74,6 +84,7 @@ class WorkflowExecutor:
             await self._execute_nodes(entry_blocks, executor, loop)
 
         self.logger.info("Workflow execution completed")
+        self.event_bus.post(WorkflowExecutionEnd(self.workflow, self, self.results))
         return self.results
 
     async def _execute_nodes(self, blocks: List[Block], executor, loop):
@@ -173,11 +184,10 @@ class WorkflowExecutor:
                 else:
                     # self.logger.debug(f"Block {block.name} is terminal node")
                     pass
+            except BlockExecutionFailedException as e:
+                raise e
             except Exception as e:
-                self.logger.error(
-                    f"Block {block.name} execution failed: {str(e)}", exc_info=True
-                )
-                raise RuntimeError(f"Block {block.name} execution failed: {e}")
+                raise BlockExecutionFailedException(f"Block {block.name} execution failed: {e}") from e
 
     def _can_execute(self, block: Block) -> bool:
         """检查节点是否可以执行"""
@@ -241,11 +251,11 @@ class WorkflowExecutor:
                     ]
                     # self.logger.debug(f"Resolved input {input_name} from {wire.source_block.name}.{wire.source_output}")
                 else:
-                    raise RuntimeError(
+                    raise BlockExecutionFailedException(
                         f"Source block {wire.source_block.name} not executed for input {input_name}"
                     )
             elif not block.inputs[input_name].nullable:
-                raise RuntimeError(
+                raise BlockExecutionFailedException(
                     f"Missing wire connection for required input {input_name} in block {block.name}"
                 )
 

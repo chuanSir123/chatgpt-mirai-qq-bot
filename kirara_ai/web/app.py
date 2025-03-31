@@ -1,25 +1,30 @@
 import asyncio
 import mimetypes
 import os
+import socket
 from pathlib import Path
 
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
-from quart import Quart, g
-from quart_cors import cors
-from werkzeug.exceptions import NotFound
+from quart import Quart, g, jsonify
 
 from kirara_ai.config.global_config import GlobalConfig
 from kirara_ai.ioc.container import DependencyContainer
 from kirara_ai.logger import HypercornLoggerWrapper, get_logger
 from kirara_ai.web.auth.services import AuthService, FileBasedAuthService
+from kirara_ai.web.utils import create_no_cache_response
 
 from .api.block import block_bp
 from .api.dispatch import dispatch_bp
 from .api.im import im_bp
 from .api.llm import llm_bp
+from .api.media import media_bp
 from .api.plugin import plugin_bp
 from .api.system import system_bp
+from .api.tracing import tracing_bp
 from .api.workflow import workflow_bp
 from .auth.routes import auth_bp
 
@@ -53,11 +58,63 @@ ERROR_MESSAGE = """
 """
 
 
-def create_app(container: DependencyContainer) -> Quart:
-    app = Quart(__name__)
-    cwd = os.getcwd()
-    app.static_folder = f"{cwd}/web"
-    
+cwd = os.getcwd()
+STATIC_FOLDER = f"{cwd}/web"
+
+logger = get_logger("WebServer")
+
+custom_static_assets: dict[str, str] = {}
+
+def create_web_api_app(container: DependencyContainer) -> Quart:
+    """创建 Web API 应用（Quart）"""
+    app = Quart(__name__, static_folder=STATIC_FOLDER)
+    app.json.sort_keys = False
+
+    # 注册蓝图
+    app.register_blueprint(auth_bp, url_prefix="/api/auth")
+    app.register_blueprint(im_bp, url_prefix="/api/im")
+    app.register_blueprint(llm_bp, url_prefix="/api/llm")
+    app.register_blueprint(dispatch_bp, url_prefix="/api/dispatch")
+    app.register_blueprint(block_bp, url_prefix="/api/block")
+    app.register_blueprint(workflow_bp, url_prefix="/api/workflow")
+    app.register_blueprint(plugin_bp, url_prefix="/api/plugin")
+    app.register_blueprint(system_bp, url_prefix="/api/system")
+    app.register_blueprint(media_bp, url_prefix="/api/media")
+    app.register_blueprint(tracing_bp, url_prefix="/api/tracing")
+
+    @app.errorhandler(Exception)
+    def handle_exception(error):
+        logger.opt(exception=error).error("Error during request")
+        response = jsonify({"error": str(error)})
+        response.status_code = 500
+        return response
+
+    # 在每个请求前将容器注入到上下文
+    @app.before_request
+    async def inject_container():
+        g.container = container
+
+    @app.before_websocket
+    async def inject_container():
+        g.container = container
+
+    app.container = container
+
+    return app
+
+def create_app(container: DependencyContainer) -> FastAPI:
+    """创建主应用（FastAPI）"""
+    app = FastAPI()
+
+    # 配置 CORS
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     # 强制设置 MIME 类型
     mimetypes.add_type("text/html", ".html")
     mimetypes.add_type("text/css", ".css")
@@ -67,49 +124,87 @@ def create_app(container: DependencyContainer) -> Quart:
     mimetypes.add_type("image/jpeg", ".jpg")
     mimetypes.add_type("image/gif", ".gif")
     mimetypes.add_type("image/webp", ".webp")
-    
 
-    @app.route("/")
-    async def index():
+
+    # 自定义静态资源处理
+    async def serve_custom_static(path: str, request: Request):
+        if path not in custom_static_assets:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        file_path = Path(custom_static_assets[path])
         try:
-            return await app.send_static_file("index.html")
+            return await create_no_cache_response(file_path, request)
         except Exception as e:
-            return ERROR_MESSAGE.replace("TARGET_DIR", f"{cwd}/web")
+            logger.error(f"处理自定义静态资源时出错: {e}")
+            raise HTTPException(status_code=500, detail="Internal server error")
 
-    @app.route("/<path:path>")
-    async def serve_static(path):
-        if path.startswith("backend-api"):
-            raise NotFound()
+    @app.get("/")
+    async def index(request: Request):
         try:
-            return await app.send_static_file(path)
+            index_path = Path(STATIC_FOLDER) / "index.html"
+            if not index_path.exists():
+                return HTMLResponse(content=ERROR_MESSAGE.replace("TARGET_DIR", STATIC_FOLDER))
+
+            return await create_no_cache_response(index_path, request)
         except Exception as e:
-            return await app.send_static_file("index.html")
+            logger.error(f"Error serving index: {e}")
+            return HTMLResponse(content=ERROR_MESSAGE.replace("TARGET_DIR", STATIC_FOLDER))
 
-    app = cors(app)  # 启用CORS支持
-    app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 3600
-    # 注册蓝图
-    app.register_blueprint(auth_bp, url_prefix="/backend-api/api/auth")
-    app.register_blueprint(im_bp, url_prefix="/backend-api/api/im")
-    app.register_blueprint(llm_bp, url_prefix="/backend-api/api/llm")
-    app.register_blueprint(dispatch_bp, url_prefix="/backend-api/api/dispatch")
-    app.register_blueprint(block_bp, url_prefix="/backend-api/api/block")
-    app.register_blueprint(workflow_bp, url_prefix="/backend-api/api/workflow")
-    app.register_blueprint(plugin_bp, url_prefix="/backend-api/api/plugin")
-    app.register_blueprint(system_bp, url_prefix="/backend-api/api/system")
+    @app.middleware("http")
+    async def spa_middleware(request: Request, call_next):
+        path = request.url.path
+        # 如果请求路径在自定义静态资源列表中，则返回自定义静态资源
+        if path in custom_static_assets:
+            return await serve_custom_static(path, request)
 
-    # 在每个请求前将容器注入到上下文
-    @app.before_request
-    async def inject_container():
-        g.container = container
+        skip_paths = [route.path for route in app.routes]
 
-    app.container = container
+        # 如果路径在跳过路径列表中，则直接返回
+        if any(path == skip_path for skip_path in skip_paths):
+            return await call_next(request)
+
+        skip_paths.remove("/")
+
+        # 如果路径以 backend-api 开头，交由内置路由处理
+        if any(path.startswith(skip_path) for skip_path in skip_paths):
+            return await call_next(request)
+
+        file_path = Path(STATIC_FOLDER) / path.lstrip('/')
+        # 检查路径穿越
+        if not file_path.resolve().is_relative_to(Path(STATIC_FOLDER).resolve()):
+            raise HTTPException(status_code=404, detail="Access denied")
+
+        # 如果文件存在，返回文件并禁止缓存
+        if file_path.is_file():
+            try:
+                return await create_no_cache_response(file_path, request)
+            except Exception as e:
+                logger.error(f"处理静态文件时出错: {e}")
+                return FileResponse(file_path)  # 退回到普通文件响应
+
+        fallback_path = Path(STATIC_FOLDER) / "index.html"
+        # 否则返回 index.html（SPA 路由）
+        if fallback_path.is_file():
+            try:
+                return await create_no_cache_response(fallback_path, request)
+            except Exception as e:
+                logger.error(f"处理index.html时出错: {e}")
+                return FileResponse(fallback_path)  # 退回到普通文件响应
+        else:
+            return PlainTextResponse(status_code=404, content="route not found")
 
     return app
 
 
 class WebServer:
+    app: FastAPI
+    web_api_app: Quart
+
     def __init__(self, container: DependencyContainer):
         self.app = create_app(container)
+        self.web_api_app = create_web_api_app(container)
+        self.server_task = None
+        self.shutdown_event = asyncio.Event()
         container.register(
             AuthService,
             FileBasedAuthService(
@@ -118,7 +213,6 @@ class WebServer:
             ),
         )
         self.config = container.resolve(GlobalConfig)
-        self.logger = get_logger("WebServer")
 
         # 配置 hypercorn
         from hypercorn.logging import Logger
@@ -126,7 +220,7 @@ class WebServer:
         self.hypercorn_config = Config()
         self.hypercorn_config.bind = [f"{self.config.web.host}:{self.config.web.port}"]
         self.hypercorn_config._log = Logger(self.hypercorn_config)
-        
+
         # 创建自定义的日志包装器，添加 URL 过滤
         class FilteredLoggerWrapper(HypercornLoggerWrapper):
             def info(self, message, *args, **kwargs):
@@ -139,30 +233,58 @@ class WebServer:
                     if path in str(args):
                         return
                 super().info(message, *args, **kwargs)
-        
+
         # 使用新的过滤日志包装器
-        self.hypercorn_config._log.access_logger = FilteredLoggerWrapper(self.logger)
-        self.hypercorn_config._log.error_logger = HypercornLoggerWrapper(self.logger)
+        self.hypercorn_config._log.access_logger = FilteredLoggerWrapper(logger)
+        self.hypercorn_config._log.error_logger = HypercornLoggerWrapper(logger)
+
+        # 挂载 Web API 应用
+        self.mount_app("/backend-api", self.web_api_app)
+
+    def mount_app(self, prefix: str, app):
+        """挂载子应用到指定路径前缀"""
+        self.app.mount(prefix, app)
+
+    def _check_port_available(self, host: str, port: int) -> bool:
+        """检查端口是否可用"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, port))
+                return True
+            except socket.error:
+                return False
 
     async def start(self):
         """启动Web服务器"""
-        self.server_task = asyncio.create_task(serve(self.app, self.hypercorn_config))
-        self.logger.info(
+        # 检查端口是否被占用
+        if not self._check_port_available(self.config.web.host, self.config.web.port):
+            error_msg = f"端口 {self.config.web.port} 已被占用，无法启动服务器，请修改端口或关闭其他占用端口的程序。"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
+        self.server_task = asyncio.create_task(serve(self.app, self.hypercorn_config, shutdown_trigger=self.shutdown_event.wait))
+        logger.info(
             f"监听地址：http://{self.config.web.host}:{self.config.web.port}/"
         )
 
     async def stop(self):
         """停止Web服务器"""
-        if hasattr(self, "server_task"):
-            self.server_task.cancel()
+        self.shutdown_event.set()
+
+        if self.server_task:
             try:
-                await self.server_task
+                await asyncio.wait_for(self.server_task, timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning("Server shutdown timed out after 3 seconds.")
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                self.logger.error(f"Error during server shutdown: {e}")
-        try:
-            await self.app.shutdown()
-        except Exception as e:
-            self.logger.error(f"Error during app shutdown: {e}")
+                logger.error(f"Error during server shutdown: {e}")
 
+    def add_static_assets(self, url_path: str, local_path: str):
+        """添加自定义静态资源"""
+        if not os.path.exists(local_path):
+            logger.warning(f"Static asset path does not exist: {local_path}")
+            return
+
+        custom_static_assets[url_path] = local_path

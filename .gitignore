@@ -20,3 +20,6 @@ build/
 *.egg-info/
 .coverage
 /web/
+botpy.log*
+data/frpc/
+data/db/

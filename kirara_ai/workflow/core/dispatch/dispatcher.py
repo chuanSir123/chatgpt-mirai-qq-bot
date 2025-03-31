@@ -2,12 +2,13 @@ from kirara_ai.im.adapter import IMAdapter
 from kirara_ai.im.message import IMMessage
 from kirara_ai.ioc.container import DependencyContainer
 from kirara_ai.logger import get_logger
-from kirara_ai.workflow.core.block.registry import BlockRegistry
 from kirara_ai.workflow.core.dispatch.registry import DispatchRuleRegistry
 from kirara_ai.workflow.core.dispatch.rules.base import DispatchRule
 from kirara_ai.workflow.core.execution.executor import WorkflowExecutor
 from kirara_ai.workflow.core.workflow.base import Workflow
 from kirara_ai.workflow.core.workflow.registry import WorkflowRegistry
+
+from .exceptions import WorkflowNotFoundException
 
 
 class WorkflowDispatcher:
@@ -38,20 +39,17 @@ class WorkflowDispatcher:
                 try:
                     self.logger.debug(f"Matched rule {rule}, executing workflow")
                     with self.container.scoped() as scoped_container:
-                        block_registry = self.container.resolve(BlockRegistry)
                         scoped_container.register(IMAdapter, source)
                         scoped_container.register(IMMessage, message)
                         workflow = rule.get_workflow(scoped_container)
                         if workflow is None:
-                            self.logger.error(f"Workflow {rule} not found")
-                            continue
-                        executor = WorkflowExecutor(workflow, block_registry)
+                            raise WorkflowNotFoundException(f"Workflow for rule {rule.name} not found, please check the rule configuration")
                         scoped_container.register(Workflow, workflow)
+                        executor = WorkflowExecutor(scoped_container)
                         scoped_container.register(WorkflowExecutor, executor)
                         return await executor.run()
                 except Exception as e:
-                    self.logger.exception(e)
-                    self.logger.error(f"Workflow execution failed: {e}")
-                    raise e
+                    self.logger.opt(exception=e).error(f"Workflow execution failed: {e}", exc_info=True)
+                    return None
         self.logger.debug("No matching rule found for message")
         return None

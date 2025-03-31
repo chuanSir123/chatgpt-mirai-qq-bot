@@ -1,14 +1,18 @@
 import os
 import shutil
 from functools import wraps
-from typing import Type
+from typing import Generic, Optional, TypeVar
 
 from pydantic import BaseModel, ValidationError
+from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
 from ruamel.yaml import YAML
 
 from ..logger import get_logger
 
 CONFIG_FILE = "data/config.yaml"
+
+T = TypeVar("T", bound=BaseModel)
+
 class ConfigLoader:
     """
     配置文件加载器，支持加载和保存 YAML 文件，并保留注释。
@@ -17,7 +21,7 @@ class ConfigLoader:
     yaml = YAML()
 
     @staticmethod
-    def load_config(config_path: str, config_class: Type[BaseModel]) -> BaseModel:
+    def load_config(config_path: str, config_class: Generic[T]) -> T:
         """
         从 YAML 文件中加载配置，并将其序列化为相应的配置对象。
         :param config_path: 配置文件路径。
@@ -77,3 +81,10 @@ def pydantic_validation_wrapper(func):
             raise  # 可以选择重新抛出异常，或者处理异常后返回一个默认值
 
     return wrapper
+
+class ConfigJsonSchema(GenerateJsonSchema):
+    def sort(
+        self, value: JsonSchemaValue, parent_key: Optional[str] = None
+    ) -> JsonSchemaValue:
+        """No-op, we don't want to sort schema values at all."""
+        return value
