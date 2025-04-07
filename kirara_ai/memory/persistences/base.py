@@ -1,7 +1,7 @@
 import threading
 from abc import ABC, abstractmethod
 from queue import Empty, Queue
-from typing import List
+from typing import List, Tuple
 
 from kirara_ai.logger import get_logger
 from kirara_ai.memory.entry import MemoryEntry
@@ -28,7 +28,7 @@ class AsyncMemoryPersistence:
 
     def __init__(self, persistence: MemoryPersistence):
         self.persistence = persistence
-        self.queue = Queue()
+        self.queue: Queue[Tuple[str, List[MemoryEntry]]] = Queue()
         self.running = True
         self.worker = threading.Thread(target=self._worker, daemon=True)
         self.worker.start()
@@ -39,7 +39,7 @@ class AsyncMemoryPersistence:
                 scope_key, entries = self.queue.get(timeout=1)
                 self.persistence.save(scope_key, entries)
                 self.queue.task_done()
-                print(f"Saved {scope_key} with {len(entries)} entries")
+                logger.info(f"Saved {scope_key} with {len(entries)} entries")
             except Empty:
                 continue
             except Exception as e:

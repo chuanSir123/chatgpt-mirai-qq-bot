@@ -1,6 +1,6 @@
+import asyncio
 import importlib
 import os
-import subprocess
 import sys
 from typing import Dict, List, Optional, Type
 
@@ -21,13 +21,13 @@ class PluginLoader:
         self.plugin_infos: Dict[str, PluginInfo] = {}  # 存储插件信息
         self.container = container
         self.logger = get_logger("PluginLoader")
-        self._loaded_entry_points = set()  # 记录已加载的entry points
+        self._loaded_entry_points: set[str] = set()  # 记录已加载的entry points
         self.plugin_dir = plugin_dir
-        self.internal_plugins = []
+        self.internal_plugins: List[str] = []
         self.config = self.container.resolve(GlobalConfig)
         self.event_bus = self.container.resolve(EventBus)
 
-    def register_plugin(self, plugin_class: Type[Plugin], plugin_name: str = None):
+    def register_plugin(self, plugin_class: Type[Plugin], plugin_name: Optional[str] = None):
         """注册一个插件类，主要用于测试"""
         plugin = self.instantiate_plugin(plugin_class)
         key = plugin_name or plugin_class.__name__
@@ -59,7 +59,7 @@ class PluginLoader:
         if not plugin_dir:
             plugin_dir = self.plugin_dir
         self.logger.info(f"Discovering internal plugins from directory: {plugin_dir}")
-        importlib.sys.path.append(plugin_dir)
+        sys.path.append(plugin_dir)
 
         for plugin_name in os.listdir(plugin_dir):
             plugin_path = os.path.join(plugin_dir, plugin_name)
@@ -189,7 +189,8 @@ class PluginLoader:
         for plugin_name, plugin in self.plugins.items():
             try:
                 plugin.on_stop()
-                plugin.event_bus.unregister_all()
+                if isinstance(plugin.event_bus, PluginEventBus):
+                    plugin.event_bus.unregister_all()
                 self.logger.info(f"Plugin {plugin.__class__.__name__} stopped")
                 self.event_bus.post(PluginStopped(plugin))
             except Exception as e:
@@ -218,13 +219,31 @@ class PluginLoader:
                 cmd.append(package_name)
 
             # 执行安装
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            self.logger.info(f"Installing plugin: {package_name}")
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-            stdout, stderr = process.communicate()
-            self.logger.info(f"Install plugin {package_name} output: {stdout.decode()}")
-            if process.returncode != 0:
-                raise Exception(f"Failed to install plugin: {stderr.decode()}")
+            
+            # 实时处理输出
+            async def read_stream(stream, log_func):
+                while True:
+                    line = await stream.readline()
+                    if not line:
+                        break
+                    log_func(line.decode().strip())
+            
+            # 并行处理 stdout 和 stderr
+            await asyncio.gather(
+                read_stream(process.stdout, lambda msg: self.logger.info(f"[{package_name} install] {msg}")),
+                read_stream(process.stderr, lambda msg: self.logger.error(f"[{package_name} install] {msg}"))
+            )
+            
+            # 等待进程完成
+            return_code = await process.wait()
+            if return_code != 0:
+                raise Exception(f"Failed to install plugin: return code {return_code}")
 
             # 导入并加载插件
             self.discover_external_plugins()
@@ -253,7 +272,8 @@ class PluginLoader:
 
             # 卸载前先禁用插件
             await self.disable_plugin(plugin_name)
-
+            assert plugin_info.package_name is not None
+            
             # 执行卸载
             cmd = [
                 sys.executable,
@@ -263,16 +283,32 @@ class PluginLoader:
                 "-y",
                 plugin_info.package_name,
             ]
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            
+            self.logger.info(f"Uninstalling plugin: {plugin_info.package_name}")
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-            stdout, stderr = process.communicate()
-            self.logger.info(
-                f"Uninstall plugin {plugin_info.package_name} output: {stdout.decode()}"
+            
+            # 实时处理输出
+            async def read_stream(stream, log_func):
+                while True:
+                    line = await stream.readline()
+                    if not line:
+                        break
+                    log_func(line.decode().strip())
+            
+            # 并行处理 stdout 和 stderr
+            await asyncio.gather(
+                read_stream(process.stdout, lambda msg: self.logger.info(f"[{plugin_info.package_name} uninstall] {msg}")),
+                read_stream(process.stderr, lambda msg: self.logger.error(f"[{plugin_info.package_name} uninstall] {msg}"))
             )
-
-            if process.returncode != 0:
-                raise Exception(f"Failed to uninstall plugin: {stderr.decode()}")
+            
+            # 等待进程完成
+            return_code = await process.wait()
+            if return_code != 0:
+                raise Exception(f"Failed to uninstall plugin: return code {return_code}")
 
             # 清理插件信息
             if plugin_name in self.plugin_infos:
@@ -352,20 +388,23 @@ class PluginLoader:
             self.logger.error(f"Failed to disable plugin {plugin_name}: {e}")
             return False
 
-    async def update_plugin(self, plugin_name: str) -> Optional[PluginInfo]:
+    async def update_plugin(self, plugin_name: str, new_package_name: Optional[str] = None) -> Optional[PluginInfo]:
         """更新插件"""
         try:
             plugin_info = self.plugin_infos.get(plugin_name)
             if not plugin_info:
                 return None
+            
+            assert plugin_info.package_name is not None
 
             if plugin_info.is_internal:
                 raise Exception("Cannot update internal plugin")
 
             # 获取当前版本
             old_version = plugin_info.version
-            # 先关闭插件
-            await self.disable_plugin(plugin_name)
+            # 先卸载旧插件
+            await self.uninstall_plugin(plugin_name)
+            
             # 执行更新
             cmd = [
                 sys.executable,
@@ -375,18 +414,34 @@ class PluginLoader:
                 "--upgrade",
                 "--index-url",
                 self.config.update.pypi_registry,
-                plugin_info.package_name,
-            ]
+                new_package_name or plugin_info.package_name,
+            ]      
 
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            self.logger.info(f"Updating plugin: {plugin_info.package_name}")
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-            stdout, stderr = process.communicate()
-            self.logger.info(
-                f"Update plugin {plugin_info.package_name} output: {stdout.decode()}"
+            
+            # 实时处理输出
+            async def read_stream(stream, log_func):
+                while True:
+                    line = await stream.readline()
+                    if not line:
+                        break
+                    log_func(line.decode().strip())
+            
+            # 并行处理 stdout 和 stderr
+            await asyncio.gather(
+                read_stream(process.stdout, lambda msg: self.logger.info(f"[{plugin_info.package_name} update] {msg}")),
+                read_stream(process.stderr, lambda msg: self.logger.error(f"[{plugin_info.package_name} update] {msg}"))
             )
-            if process.returncode != 0:
-                raise Exception(f"Failed to update plugin: {stderr.decode()}")
+            
+            # 等待进程完成
+            return_code = await process.wait()
+            if return_code != 0:
+                raise Exception(f"Failed to update plugin: return code {return_code}")
 
             self.discover_external_plugins()
             possible_plugin_infos = [
@@ -399,7 +454,7 @@ class PluginLoader:
                     return possible_plugin_infos[0]
                 else:
                     raise Exception(
-                        f"Failed to update plugin: {plugin_info.package_name} is already up to date"
+                        f"Failed to update plugin: {plugin_info.package_name} is already up to date for current Kirara AI version. Maybe you should update Kirara AI to the latest version."
                     )
 
         except Exception as e:

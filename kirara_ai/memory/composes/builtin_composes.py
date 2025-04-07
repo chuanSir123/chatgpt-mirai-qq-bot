@@ -1,10 +1,11 @@
 import re
 from datetime import datetime, timedelta
-from typing import List, Union
+from typing import List, Optional, Union
 
 from kirara_ai.im.message import IMMessage, MediaMessage, TextMessage
 from kirara_ai.im.sender import ChatSender
-from kirara_ai.llm.format.message import LLMChatImageContent, LLMChatMessage, LLMChatTextContent
+from kirara_ai.llm.format.message import (LLMChatContentPartType, LLMChatImageContent, LLMChatMessage, LLMToolCallContent,
+                                          LLMToolResultContent, LLMChatTextContent, RoleType)
 from kirara_ai.logger import get_logger
 from kirara_ai.media.manager import MediaManager
 from kirara_ai.memory.entry import MemoryEntry
@@ -17,13 +18,15 @@ def drop_think_part(text: str) -> str:
 
 class DefaultMemoryComposer(MemoryComposer):
     def compose(
-        self, sender: ChatSender, message: List[ComposableMessageType]
+        self, sender: Optional[ChatSender], message: List[ComposableMessageType]
     ) -> MemoryEntry:
         composed_message = ""
         media_ids = []
+        tool_calls = []
+        tool_results = []
         for msg in message:
             if isinstance(msg, IMMessage):
-                composed_message += f"{sender.display_name} 说: \n"
+                composed_message += f"{msg.sender.display_name} 说: \n"
                 for element in msg.message_elements:
                     if isinstance(element, MediaMessage):
                         desc = element.get_description()
@@ -34,35 +37,47 @@ class DefaultMemoryComposer(MemoryComposer):
                     else:
                         composed_message += element.to_plain()
             elif isinstance(msg, LLMChatMessage):
-                composed_message += f"你回答: \n"
+                temp = ""
                 for part in msg.content:
                     if isinstance(part, LLMChatTextContent):
-                        composed_message += f"{drop_think_part(part.text)}\n"
+                        temp += f"{drop_think_part(part.text)}\n"
                     elif isinstance(part, LLMChatImageContent):
                         media = self.container.resolve(MediaManager).get_media(part.media_id)
-                        desc = media.description
-                        composed_message += f"<media_msg id={part.media_id} desc=\"{desc}\" />\n"
+                        desc = media.description if media else ""
+                        temp += f"<media_msg id={part.media_id} desc=\"{desc}\" />\n"
                         media_ids.append(part.media_id)
+                    elif isinstance(part, LLMToolCallContent):
+                        # 将 工具类转化为json字符串存储减少空间占用
+                        tool_calls.append(part.model_dump_json())
+                    elif isinstance(part, LLMToolResultContent):
+                        tool_results.append(part.model_dump_json())
+                if temp.strip("\n"): 
+                    # 防止空消息,
+                    # 根据四大adapter的返回结果，LLMChatResponse 返回的是tool_call时, 其content必定为LLMToolCallContent + TextContent的深度思考内容(仅来源于claude).
+                    # 所以为了不干扰后续解压功能这里使用temp接收message，当temp去除头尾换行符后不为空时才添加到composed_message中
+                    composed_message += f"你回答: \n" + temp
 
         composed_message = composed_message.strip()
         composed_at = datetime.now()
         return MemoryEntry(
-            sender=sender,
+            sender=sender or ChatSender.get_bot_sender(),
             content=composed_message,
             timestamp=composed_at,
             metadata={
                 "_media_ids": media_ids,
+                "_tool_calls": tool_calls,
+                "_tool_results": tool_results,
             },
         )
 
 
 class DefaultMemoryDecomposer(MemoryDecomposer):
-    def decompose(self, entries: List[MemoryEntry]) -> List[str]:
+    def decompose(self, entries: List[MemoryEntry]) -> List[ComposableMessageType]:
         if len(entries) == 0:
             return [self.empty_message]
 
         # 7秒前，<记忆内容>
-        memory_texts = []
+        memory_texts: List[ComposableMessageType] = []
         for entry in entries[-10:]:
             time_diff = datetime.now() - entry.timestamp
             time_str = self.get_time_str(time_diff)
@@ -87,8 +102,21 @@ class MultiElementDecomposer(MemoryDecomposer):
     def decompose(self, entries: List[MemoryEntry]) -> List[LLMChatMessage]:
         decomposed_messages = []
         for entry in entries:
-            # 首先判断MemoryEntry的内容是否包含"你回答:"
-            if "你回答:" in entry.content:
+            if not entry.content:
+                # content为空字符串， 证明其为工具消息
+                content: list[LLMChatContentPartType] = []
+                if tool_calls := entry.metadata.get("_tool_calls"):
+                    for call in tool_calls:
+                        tool_call = LLMToolCallContent.model_validate_json(call)
+                        content.append(tool_call)
+                    decomposed_messages.append(LLMChatMessage(role="assistant", content=content))
+                elif tool_results := entry.metadata.get("_tool_results"):
+                    for result in tool_results:
+                        tool_result = LLMToolResultContent.model_validate_json(result)
+                        content.append(tool_result)
+                    decomposed_messages.append(LLMChatMessage(role="tool", content=content))
+            # 判断MemoryEntry的内容是否包含"你回答:"
+            elif "你回答:" in entry.content:
                 # 如果包含，则分割MemoryEntry的内容为用户消息和AI回答
                 user_content = entry.content.split("你回答:")[0].strip()
                 assistant_content = entry.content.split("你回答:")[1].strip()
@@ -124,8 +152,8 @@ class MultiElementDecomposer(MemoryDecomposer):
 
         return decomposed_messages
 
-    def create_llm_chat_message(self, content: str, role: str, sender: ChatSender) -> Union[LLMChatMessage, None]:
-        message_content: List[Union[LLMChatTextContent, LLMChatImageContent]] = []
+    def create_llm_chat_message(self, content: str, role: RoleType, sender: ChatSender) -> Union[LLMChatMessage, None]:
+        message_content: List[LLMChatContentPartType] = []
 
         # 使用正则表达式提取 <media_msg> 标签
         media_msg_pattern = re.compile(r'<media_msg id=(.*?) desc="(.*?)" />')

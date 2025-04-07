@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import aiohttp
 from packaging.version import Version
 from quart import Blueprint, g, jsonify, request
@@ -6,6 +8,7 @@ from kirara_ai.config.config_loader import CONFIG_FILE, ConfigLoader
 from kirara_ai.config.global_config import GlobalConfig
 from kirara_ai.logger import get_logger
 from kirara_ai.plugin_manager.plugin_loader import PluginLoader
+from kirara_ai.web.api.system.utils import get_installed_version
 
 from ...auth.middleware import require_auth
 from .models import InstallPluginRequest, PluginList, PluginResponse
@@ -13,6 +16,13 @@ from .models import InstallPluginRequest, PluginList, PluginResponse
 plugin_bp = Blueprint("plugin", __name__)
 
 logger = get_logger("WebServer")
+
+@lru_cache(maxsize=1)
+def get_meta_params() -> dict:
+    """获取元参数"""
+    return {
+        "kirara_version": get_installed_version(),
+    }
 
 
 def is_upgradable(installed_version: str, market_version: str) -> bool:
@@ -23,12 +33,14 @@ def is_upgradable(installed_version: str, market_version: str) -> bool:
         return False
 
 
-async def fetch_from_market(path: str, params: dict = None) -> dict:
+async def fetch_from_market(path: str, params: dict | None = None) -> dict:
     """从插件市场获取数据的通用方法"""
     plugin_market_base_url = g.container.resolve(GlobalConfig).plugins.market_base_url
     async with aiohttp.ClientSession(trust_env=True) as session:
         url = f"{plugin_market_base_url}/{path}"
         logger.info(f"Fetching from market: {url}")
+        params = params or {}
+        params.update(get_meta_params())
         async with session.get(url, params=params) as response:
             if response.status != 200:
                 raise Exception(f"插件市场请求失败: {response.status}")
@@ -135,13 +147,16 @@ async def install_plugin():
         plugin_info = await loader.install_plugin(
             install_data.package_name, install_data.version
         )
-        if not plugin_info:
+        if not plugin_info or plugin_info.package_name is None:
             return jsonify({"error": "Failed to install plugin"}), 500
 
         # 更新配置
         if plugin_info.package_name not in config.plugins.enable:
             config.plugins.enable.append(plugin_info.package_name)
             ConfigLoader.save_config_with_backup(CONFIG_FILE, config)
+            
+        # 加载插件
+        loader.load_plugin(plugin_info.name)
 
         return PluginResponse(plugin=plugin_info).model_dump()
     except Exception as e:
@@ -223,8 +238,12 @@ async def disable_plugin(plugin_name: str):
     try:
         # 禁用插件
         await loader.disable_plugin(plugin_name)
+        
+        # 更新插件信息
         plugin_info = loader.get_plugin_info(plugin_name)
-
+        
+        assert plugin_info is not None
+        
         # 更新配置
         if (
             plugin_name
@@ -254,10 +273,11 @@ async def update_plugin(plugin_name: str):
     # 内部插件不支持更新
     if plugin_info.is_internal:
         return jsonify({"error": "Cannot update internal plugin"}), 400
-
+    
+    new_package_name = request.args.get("package_name", None)
     try:
         # 执行更新
-        updated_info = await loader.update_plugin(plugin_name)
+        updated_info = await loader.update_plugin(plugin_name, new_package_name)
         if not updated_info:
             return jsonify({"error": "Failed to update plugin"}), 500
 

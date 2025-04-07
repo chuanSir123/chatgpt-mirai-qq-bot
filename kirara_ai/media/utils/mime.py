@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import magic
 
@@ -13,7 +13,7 @@ mime_remapping = {
 }
 
 
-def detect_mime_type(data: bytes = None, path: str = None) -> Tuple[str, MediaType, str]:
+def detect_mime_type(data: Optional[bytes] = None, path: Optional[str] = None) -> Tuple[str, MediaType, str]:
     """
     检测文件的MIME类型
     
@@ -24,17 +24,20 @@ def detect_mime_type(data: bytes = None, path: str = None) -> Tuple[str, MediaTy
     Returns:
         Tuple[str, MediaType, str]: (mime_type, media_type, format)
     """
-    if data is not None:
-        mime_type = magic.from_buffer(data, mime=True)
-    elif path is not None:
-        mime_type = magic.from_file(path, mime=True)
-    else:
-        raise ValueError("Must provide either data or path")
-    
+    try:
+        if data is not None:
+            mime_type = magic.from_buffer(data, mime=True)
+        elif path is not None:
+            mime_type = magic.from_file(path, mime=True)
+        else:
+            raise ValueError("Must provide either data or path")
+    except Exception as e:
+        raise ValueError(f"Failed to detect mime type: {e}") from e
     if mime_type in mime_remapping:
         mime_type = mime_remapping[mime_type]
         
     media_type = MediaType.from_mime(mime_type)
     format = mime_type.split('/')[-1]
-    
+        
     return mime_type, media_type, format 
+

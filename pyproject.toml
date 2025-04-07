@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kirara-ai"
-version = "3.2.0a1"
+version = "3.2.0"
 authors = [
     { name="Lss233", email="i@lss233.com" },
 ]
@@ -66,6 +66,10 @@ kirara_ai = "kirara_ai.__main__:main"
 where = ["."]
 include = ["kirara_ai*"]
 namespaces = true
+
+[[tool.uv.index]]
+url = "https://mirrors.ustc.edu.cn/pypi/simple"
+default = true
 
 [options]
 include_package_data = true
