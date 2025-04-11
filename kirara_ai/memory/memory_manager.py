@@ -89,7 +89,7 @@ class MemoryManager(MediaReferenceProvider[List[MemoryEntry]]):
             removed_entries = self.memories[scope_key][:-self.config.max_entries]
             unremoved_entries = self.memories[scope_key][-self.config.max_entries:]
             self._remove_media_references(removed_entries, unremoved_entries, scope_key)
-                
+
             # 裁剪记忆列表
             self.memories[scope_key] = unremoved_entries
 
@@ -132,7 +132,8 @@ class MemoryManager(MediaReferenceProvider[List[MemoryEntry]]):
         """
         scope_key = scope.get_scope_key(sender)
         # 移除媒体引用
-        self._remove_media_references(self.memories[scope_key], [], scope_key)
+        if scope_key in self.memories:
+            self._remove_media_references(self.memories[scope_key], [], scope_key)
         # 清空内存中的记录
         self.memories[scope_key] = []
 
@@ -144,7 +145,7 @@ class MemoryManager(MediaReferenceProvider[List[MemoryEntry]]):
         if reference_key not in self.memories:
                 self.memories[reference_key] = self.persistence.load(reference_key)
         return self.memories.get(reference_key)
-    
+
     def _register_media_reference(self, entry: MemoryEntry, reference_key: str) -> None:
         """注册媒体引用"""
         media_carrier = self.container.resolve(MediaCarrierService)

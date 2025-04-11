@@ -4,7 +4,7 @@ from typing import Optional, cast
 import aiohttp
 import requests
 from pydantic import BaseModel, ConfigDict
-
+import base64
 from kirara_ai.llm.adapter import AutoDetectModelsProtocol, LLMBackendAdapter
 from kirara_ai.llm.format.message import (LLMChatContentPartType, LLMChatImageContent, LLMChatMessage,
                                           LLMChatTextContent, LLMToolCallContent, LLMToolResultContent)
@@ -12,6 +12,8 @@ from kirara_ai.llm.format.request import LLMChatRequest
 from kirara_ai.llm.format.response import Function, LLMChatResponse, Message, ToolCall, Usage
 from kirara_ai.logger import get_logger
 from kirara_ai.media import MediaManager
+from kirara_ai.logger import get_logger
+from typing import Any, List, Optional
 from kirara_ai.tracing import trace_llm_chat
 
 logger = get_logger("OpenAIAdapter")
@@ -73,7 +75,7 @@ class OpenAIConfig(BaseModel):
 
 class OpenAIAdapter(LLMBackendAdapter, AutoDetectModelsProtocol):
     media_manager: MediaManager
-    
+
     def __init__(self, config: OpenAIConfig):
         self.config = config
     @trace_llm_chat
@@ -83,7 +85,7 @@ class OpenAIAdapter(LLMBackendAdapter, AutoDetectModelsProtocol):
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
         }
-        
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
@@ -108,8 +110,7 @@ class OpenAIAdapter(LLMBackendAdapter, AutoDetectModelsProtocol):
 
         # Remove None fields
         data = {k: v for k, v in data.items() if v is not None}
-        
-        logger.debug(f"Request: {data}")
+
 
         response = requests.post(api_url, json=data, headers=headers)
         try:
@@ -123,7 +124,7 @@ class OpenAIAdapter(LLMBackendAdapter, AutoDetectModelsProtocol):
         choices = response_data.get("choices", [{}])
         first_choice = choices[0] if choices else {}
         message: dict = first_choice.get("message", {})
-        
+
         # 检测tool_calls字段是否存在和是否不为None. tool_call时content字段无有效信息，暂不记录
         content: list[LLMChatContentPartType] = []
         if tool_calls := message.get("tool_calls", None):
@@ -133,24 +134,37 @@ class OpenAIAdapter(LLMBackendAdapter, AutoDetectModelsProtocol):
                 parameters=call["function"].get("parameters", None)
             ) for call in tool_calls]
         else:
-            content = [LLMChatTextContent(text=message.get("content", ""))]
+            for part in choices:
+                if (isinstance(part["message"]["content"], str) or "text" in part["message"]["content"]) and part["message"]["content"]:
+                    content.append(LLMChatTextContent(text=part["message"]["content"]))
+                elif isinstance(part["message"]["content"], list) :
+                    for sub_part in part["message"]["content"]:
+                        if "text" in sub_part and sub_part["text"]:
+                            content.append(LLMChatTextContent(text=sub_part["text"]))
+                        elif "image_url" in sub_part:
+                            if sub_part["image_url"]["url"].startswith("http"):
+                                media = loop.run_until_complete(self.media_manager.register_from_url(url=sub_part["image_url"]["url"]))
+                            else:
+                                base64_data = base64.b64decode(sub_part["image_url"]["url"])
+                                media = loop.run_until_complete(self.media_manager.register_from_data(data=base64_data, format="png", source="gemini response"))
+                            content.append(LLMChatImageContent(media_id=media))
 
         usage_data = response_data.get("usage", {})
-        
+
         return LLMChatResponse(
             model=req.model,
             usage=Usage(
-                prompt_tokens=usage_data.get("prompt_tokens", 0),
-                completion_tokens=usage_data.get("completion_tokens", 0),
-                total_tokens=usage_data.get("total_tokens", 0),
-            ),
+                prompt_tokens=response_data["usage"]["prompt_tokens"],
+                completion_tokens=response_data["usage"]["completion_tokens"],
+                total_tokens=response_data["usage"]["total_tokens"],
+            ) if "usage" in response_data else None,
             message=Message(
                 content=content,
                 role=message.get("role", "assistant"),
                 # tool_calls=[
                 #     ToolCall(
                 #         model = "openai",
-                #         id=tool_call["id"], 
+                #         id=tool_call["id"],
                 #         type=tool_call["type"],
                 #         function=Function(name = tool_call["function"]["name"], arguments=tool_call["function"].get("arguments", None))
                 #     ) for tool_call in message.get("tool_calls")
